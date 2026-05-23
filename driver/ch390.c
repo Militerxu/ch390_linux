@@ -37,9 +37,10 @@
 #include <linux/phy.h>
 #include <linux/slab.h>
 #include <linux/skbuff.h>
-#include <linux/spinlock.h>
 #include <linux/spi/spi.h>
 #include <linux/types.h>
+#include <linux/bitops.h>
+#include <linux/bitrev.h>
 #include <linux/crc32.h>
 #include <linux/version.h>
 
@@ -51,8 +52,10 @@
 #define VERSION_DESC "V1.4 On 2026.05"
 #define CH390_TX_TIMEOUT_US 750000
 #define CH390_TX_POLL_DELAY_US 20
-#define CH390_DUMP_BLOCK_SIZE 64
 #define CH390_SPI_READ_BUF_SIZE (CH390_PKT_MAX + 1)
+#define CH390_RX_READY_BYTES 2
+#define CH390_RX_READY_VALID_OFFSET 1
+#define CH390_MDIO_C22_REG_MAX 0x1f
 
 /*
  * struct rx_ctl_mach - rx activities record
@@ -110,16 +113,19 @@ struct reg_label {
 	unsigned int reg;
 };
 
+static const char ch390_gstrings[][ETH_GSTRING_LEN] = {
+	"set_phypn_triggers", "linkup_restarts", "rx_status_errors",
+	"rx_length_errors",   "rx_errors",	 "tx_errors",
+	"fifo_resets",
+};
+
 static struct reg_label reg_labels[] = {
-	REG_LABEL(CH390_NCR),	REG_LABEL(CH390_NSR),
-	REG_LABEL(CH390_TCR),	REG_LABEL(CH390_TSRA),
-	REG_LABEL(CH390_TSRB),	REG_LABEL(CH390_RCR),
-	REG_LABEL(CH390_RSR),	REG_LABEL(CH390_ROCR),
-	REG_LABEL(CH390_BPTR),	REG_LABEL(CH390_FCTR),
-	REG_LABEL(CH390_FCR),	REG_LABEL(CH390_GPR),
-	REG_LABEL(CH390_ATCR),	REG_LABEL(CH390_RCSCSR),
-	REG_LABEL(CH390_INTCR), REG_LABEL(CH390_ALNCR),
-	REG_LABEL(CH390_ISR),	REG_LABEL(CH390_IMR),
+	REG_LABEL(CH390_NCR),	REG_LABEL(CH390_NSR),	 REG_LABEL(CH390_TCR),
+	REG_LABEL(CH390_TSRA),	REG_LABEL(CH390_TSRB),	 REG_LABEL(CH390_RCR),
+	REG_LABEL(CH390_RSR),	REG_LABEL(CH390_ROCR),	 REG_LABEL(CH390_BPTR),
+	REG_LABEL(CH390_FCTR),	REG_LABEL(CH390_FCR),	 REG_LABEL(CH390_GPR),
+	REG_LABEL(CH390_ATCR),	REG_LABEL(CH390_RCSCSR), REG_LABEL(CH390_INTCR),
+	REG_LABEL(CH390_ALNCR), REG_LABEL(CH390_ISR),	 REG_LABEL(CH390_IMR),
 };
 
 struct ch39x_regs {
@@ -156,6 +162,14 @@ struct ch39x_ops {
 	void (*set_phypn)(struct ch390_priv *dev);
 };
 
+enum ch390_flags {
+	CH390_DEV_STOPPING,
+	CH390_LINK_CHECK_ENABLED,
+	CH390_LINKDN_CHECK_PENDING,
+	CH390_LINKDN_CHECK_AUTONEG,
+	CH390_LINKUP_CHECK_ACTIVE,
+};
+
 /*
  * struct ch390_priv - maintain the saved data
  * @spidev: spi device structure
@@ -163,16 +177,15 @@ struct ch39x_ops {
  * @mdiobus: mii bus structure
  * @phydev: phy device structure
  * @txq: tx queue structure
- * @rxctrl_work: Work queue for updating RX mode and multicast lists
+ * @rx_mode_work: Work queue for applying RX mode and multicast lists
  * @tx_work: Work queue for tx packets
+ * @tx_timeout_work: Work queue for TX timeout recovery
  * @pause: ethtool pause parameter structure
- * @spi_lockm: between threads lock structure
- * @phy_mutex: PHY reg write/read lock structure
- * @reg_mutex: reg write/read lock structure
- * @rctl_lock: RX control setting lock structure
+ * @spi_lockm: serialize MAC data-path and state-change SPI sequences
+ * @phy_mutex: serialize CH390 EPCR-backed PHY/EEPROM transactions
+ * @reg_mutex: serialize low-level CH390 register/memory SPI transfers
  * @bc: rx control statistics structure
  * @rxhdr: rx header structure
- * @rctl: rx control setting structure
  * @msg_enable: message level value
  * @imr_all: to store operating imr value for register ch390_IMR
  * @lcr_all: to store operating rcr value for register ch390_LMCR
@@ -182,8 +195,7 @@ struct ch39x_ops {
  * 				multiple of this value. If set to 0, a value of 1 will be
  *              used.
  * @link_name: name of the sysfs symbolic link to be created
- * @sysfs_phy_buf: buffer for parsing or formatting PHY reg address
- *                 and val in sysfs
+ * @flags: driver state bits
  * The saved data variables, keep up to date for retrieval back to use
  */
 struct ch390_priv {
@@ -196,16 +208,15 @@ struct ch390_priv {
 	struct workqueue_struct *wq;
 	struct delayed_work linkdn_work;
 	struct delayed_work linkup_work;
-	struct work_struct rxctrl_work;
+	struct work_struct rx_mode_work;
 	struct work_struct tx_work;
+	struct work_struct tx_timeout_work;
 	struct ethtool_pauseparam pause;
 	struct mutex spi_lockm;
 	struct mutex phy_mutex;
 	struct mutex reg_mutex;
-	spinlock_t rctl_lock;
 	struct rx_ctl_mach bc;
 	struct ch390_rxhdr rxhdr;
-	struct ch390_rxctrl rctl;
 	const struct ch39x_regs *regs;
 	const struct ch39x_ops *dev_ops;
 	u8 imr_all;
@@ -214,10 +225,30 @@ struct ch390_priv {
 	u8 *spi_rx_buf;
 	int reg_stride;
 	char link_name[32];
-	char sysfs_phy_buf[128];
-	bool check_flag;
-	bool linkup_check_active;
+	unsigned long flags;
+	u64 set_phypn_triggers;
+	u64 linkup_restarts;
 };
+
+/*
+ * Hardware lock order:
+ *
+ *   spi_lockm -> mdiobus->mdio_lock -> phy_mutex -> reg_mutex
+ *
+ * Reset and PHY power transitions can disturb the EPCR indirect-access engine,
+ * so they wait for both phylib/user MDIO page sequences and direct EPCR users.
+ */
+static void ch390_lock_epcr_users(struct ch390_priv *dev)
+{
+	mutex_lock(&dev->mdiobus->mdio_lock);
+	mutex_lock(&dev->phy_mutex);
+}
+
+static void ch390_unlock_epcr_users(struct ch390_priv *dev)
+{
+	mutex_unlock(&dev->phy_mutex);
+	mutex_unlock(&dev->mdiobus->mdio_lock);
+}
 
 static void ch390_set_phypn(struct ch390_priv *dev);
 static void ch390_latch_phypn(struct ch390_priv *dev);
@@ -248,9 +279,8 @@ static int ch390_set_reg_unlocked(struct ch390_priv *dev, u8 reg, u8 val)
 
 	ret = spi_sync(dev->spidev, &msg);
 	if (ret < 0)
-		netif_err(dev, drv, dev->ndev,
-			  "%s: error %d set reg %02x\n", __func__, ret,
-			  reg);
+		netif_err(dev, drv, dev->ndev, "%s: error %d set reg %02x\n",
+			  __func__, ret, reg);
 
 	return ret;
 }
@@ -266,8 +296,7 @@ static int ch390_set_reg(struct ch390_priv *dev, u8 reg, u8 val)
 	return ret;
 }
 
-static int ch390_get_reg_unlocked(struct ch390_priv *dev, u8 reg,
-				  void *val)
+static int ch390_get_reg_unlocked(struct ch390_priv *dev, u8 reg, void *val)
 {
 	struct spi_transfer xfer = {};
 	struct spi_message msg;
@@ -284,9 +313,8 @@ static int ch390_get_reg_unlocked(struct ch390_priv *dev, u8 reg,
 
 	ret = spi_sync(dev->spidev, &msg);
 	if (ret < 0)
-		netif_err(dev, drv, dev->ndev,
-			  "%s: error %d get reg %02x\n", __func__, ret,
-			  reg);
+		netif_err(dev, drv, dev->ndev, "%s: error %d get reg %02x\n",
+			  __func__, ret, reg);
 	else
 		*(u8 *)val = rx_buf[1];
 
@@ -304,8 +332,7 @@ static int ch390_get_reg(struct ch390_priv *dev, u8 reg, void *val)
 	return ret;
 }
 
-static int ch390_update_bits(struct ch390_priv *dev, u8 reg, u8 mask,
-			     u8 val)
+static int ch390_update_bits(struct ch390_priv *dev, u8 reg, u8 mask, u8 val)
 {
 	int ret;
 	u8 current_val;
@@ -334,69 +361,6 @@ out_unlock:
 	return ret;
 }
 
-static int ch390_read_data_unlocked(struct ch390_priv *dev, u8 reg,
-				    void *buff, size_t len)
-{
-	struct spi_transfer xfer = {};
-	struct spi_message msg;
-	int ret;
-
-	if (!len)
-		return 0;
-
-	if (!dev->spi_tx_buf || !dev->spi_rx_buf)
-		return -ENOMEM;
-
-	if (len > CH390_SPI_READ_BUF_SIZE - 1)
-		return -EMSGSIZE;
-
-	dev->spi_tx_buf[0] = reg;
-	memset(dev->spi_tx_buf + 1, 0, len);
-
-	xfer.tx_buf = dev->spi_tx_buf;
-	xfer.rx_buf = dev->spi_rx_buf;
-	xfer.len = len + 1;
-
-	spi_message_init(&msg);
-	spi_message_add_tail(&xfer, &msg);
-
-	ret = spi_sync(dev->spidev, &msg);
-	if (!ret && buff) {
-		/* The first received byte belongs to the command phase. */
-		memcpy(buff, dev->spi_rx_buf + 1, len);
-	}
-
-	return ret;
-}
-
-/*
- * skb buffer exhausted, just discard the received data
- */
-static int ch390_dumpblk(struct ch390_priv *dev, u8 reg, size_t count)
-{
-	struct net_device *ndev = dev->ndev;
-	int ret = 0;
-
-	mutex_lock(&dev->reg_mutex);
-
-	while (count) {
-		size_t len = min_t(size_t, count, CH390_DUMP_BLOCK_SIZE);
-
-		ret = ch390_read_data_unlocked(dev, reg, NULL, len);
-		if (ret < 0) {
-			netif_err(dev, drv, ndev,
-				  "%s: error %d dumping read reg %02x\n",
-				  __func__, ret, reg);
-			break;
-		}
-		count -= len;
-	}
-
-	mutex_unlock(&dev->reg_mutex);
-
-	return ret;
-}
-
 static int ch390_set_regs(struct ch390_priv *dev, u8 reg, const void *val,
 			  size_t val_count, enum val_type type)
 {
@@ -414,10 +378,9 @@ static int ch390_set_regs(struct ch390_priv *dev, u8 reg, const void *val,
 			ret = ch390_set_reg_unlocked(dev, reg + i * 2,
 						     val_words[i] & 0xFF);
 			if (ret < 0) {
-				netif_err(
-					dev, drv, dev->ndev,
-					"%s: error %d writing reg %02x\n",
-					__func__, ret, reg + i * 2);
+				netif_err(dev, drv, dev->ndev,
+					  "%s: error %d writing reg %02x\n",
+					  __func__, ret, reg + i * 2);
 				break;
 			}
 
@@ -425,10 +388,9 @@ static int ch390_set_regs(struct ch390_priv *dev, u8 reg, const void *val,
 						     (val_words[i] >> 8) &
 							     0xFF);
 			if (ret < 0) {
-				netif_err(
-					dev, drv, dev->ndev,
-					"%s: error %d writing reg %02x\n",
-					__func__, ret, reg + i * 2 + 1);
+				netif_err(dev, drv, dev->ndev,
+					  "%s: error %d writing reg %02x\n",
+					  __func__, ret, reg + i * 2 + 1);
 				break;
 			}
 		}
@@ -438,10 +400,9 @@ static int ch390_set_regs(struct ch390_priv *dev, u8 reg, const void *val,
 			ret = ch390_set_reg_unlocked(dev, reg + i,
 						     val_bytes[i]);
 			if (ret < 0) {
-				netif_err(
-					dev, drv, dev->ndev,
-					"%s: error %d writing reg %02x\n",
-					__func__, ret, reg + i);
+				netif_err(dev, drv, dev->ndev,
+					  "%s: error %d writing reg %02x\n",
+					  __func__, ret, reg + i);
 				break;
 			}
 		}
@@ -468,23 +429,20 @@ static int ch390_get_regs(struct ch390_priv *dev, u8 reg, void *val,
 		for (i = 0; i < val_count / 2; i++) {
 			u8 low, high;
 
-			ret = ch390_get_reg_unlocked(dev, reg + i * 2,
-						     &low);
+			ret = ch390_get_reg_unlocked(dev, reg + i * 2, &low);
 			if (ret < 0) {
-				netif_err(
-					dev, drv, dev->ndev,
-					"%s: error %d reading reg %02x\n",
-					__func__, ret, reg + i * 2);
+				netif_err(dev, drv, dev->ndev,
+					  "%s: error %d reading reg %02x\n",
+					  __func__, ret, reg + i * 2);
 				break;
 			}
 
 			ret = ch390_get_reg_unlocked(dev, reg + i * 2 + 1,
 						     &high);
 			if (ret < 0) {
-				netif_err(
-					dev, drv, dev->ndev,
-					"%s: error %d reading reg %02x\n",
-					__func__, ret, reg + i * 2 + 1);
+				netif_err(dev, drv, dev->ndev,
+					  "%s: error %d reading reg %02x\n",
+					  __func__, ret, reg + i * 2 + 1);
 				break;
 			}
 
@@ -496,10 +454,9 @@ static int ch390_get_regs(struct ch390_priv *dev, u8 reg, void *val,
 			ret = ch390_get_reg_unlocked(dev, reg + i,
 						     &val_bytes[i]);
 			if (ret < 0) {
-				netif_err(
-					dev, drv, dev->ndev,
-					"%s: error %d reading reg %02x\n",
-					__func__, ret, reg + i);
+				netif_err(dev, drv, dev->ndev,
+					  "%s: error %d reading reg %02x\n",
+					  __func__, ret, reg + i);
 				break;
 			}
 		}
@@ -510,8 +467,7 @@ static int ch390_get_regs(struct ch390_priv *dev, u8 reg, void *val,
 	return ret;
 }
 
-static int ch390_write_mem(struct ch390_priv *dev, const void *buff,
-			   size_t len)
+static int ch390_write_mem(struct ch390_priv *dev, const void *buff, size_t len)
 {
 	struct spi_transfer xfer = {};
 	struct spi_message msg;
@@ -538,23 +494,56 @@ static int ch390_write_mem(struct ch390_priv *dev, const void *buff,
 static int ch390_read_mem(struct ch390_priv *dev, u8 reg, void *buff,
 			  size_t len)
 {
+	struct spi_transfer xfer = {};
+	struct spi_message msg;
 	int ret;
 
 	mutex_lock(&dev->reg_mutex);
 
-	ret = ch390_read_data_unlocked(dev, reg, buff, len);
-	if (ret < 0)
-		netif_err(dev, drv, dev->ndev,
-			  "%s: error %d get reg %02x\n", __func__, ret,
-			  reg);
+	if (!len) {
+		ret = 0;
+		goto out_unlock;
+	}
 
+	if (!dev->spi_tx_buf || !dev->spi_rx_buf) {
+		ret = -ENOMEM;
+		goto out_log;
+	}
+
+	if (len > CH390_SPI_READ_BUF_SIZE - 1) {
+		ret = -EMSGSIZE;
+		goto out_log;
+	}
+
+	dev->spi_tx_buf[0] = reg;
+	memset(dev->spi_tx_buf + 1, 0, len);
+
+	xfer.tx_buf = dev->spi_tx_buf;
+	xfer.rx_buf = dev->spi_rx_buf;
+	xfer.len = len + 1;
+
+	spi_message_init(&msg);
+	spi_message_add_tail(&xfer, &msg);
+
+	ret = spi_sync(dev->spidev, &msg);
+	if (!ret && buff) {
+		/* The first received byte belongs to the command phase. */
+		memcpy(buff, dev->spi_rx_buf + 1, len);
+	}
+
+out_log:
+	if (ret < 0)
+		netif_err(dev, drv, dev->ndev, "%s: error %d get reg %02x\n",
+			  __func__, ret, reg);
+
+out_unlock:
 	mutex_unlock(&dev->reg_mutex);
 
 	return ret;
 }
 
-static int ch390_wait_for_condition(struct ch390_priv *dev, u8 reg,
-				    u8 mask, unsigned int timeout_us,
+static int ch390_wait_for_condition(struct ch390_priv *dev, u8 reg, u8 mask,
+				    unsigned int timeout_us,
 				    unsigned int delay_us)
 {
 	unsigned int elapsed_us = 0;
@@ -580,24 +569,28 @@ static int ch390_epcr_poll(struct ch390_priv *dev)
 {
 	int ret;
 
-	ret = ch390_wait_for_condition(dev, CH390_EPCR, EPCR_ERRE, 10000,
-				       100);
+	ret = ch390_wait_for_condition(dev, CH390_EPCR, EPCR_ERRE, 10000, 100);
 	if (ret == -ETIMEDOUT)
-		netdev_err(dev->ndev,
-			   "eeprom/phy in processing get timeout\n");
+		netdev_err(dev->ndev, "eeprom/phy in processing get timeout\n");
 
 	return ret;
 }
 
-static int ch390_irq_flag(struct ch390_priv *dev)
+static int ch390_irq_type(struct ch390_priv *dev)
 {
 	struct spi_device *spi = dev->spidev;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0))
-	int irq_type = irq_get_trigger_type(spi->irq);
+	return irq_get_trigger_type(spi->irq);
 #else
 	struct irq_data *d = irq_get_irq_data(spi->irq);
-	int irq_type = d ? irqd_get_trigger_type(d) : 0;
+
+	return d ? irqd_get_trigger_type(d) : 0;
 #endif
+}
+
+static int ch390_irq_flag(struct ch390_priv *dev)
+{
+	int irq_type = ch390_irq_type(dev);
 
 	if (irq_type)
 		return irq_type;
@@ -605,69 +598,66 @@ static int ch390_irq_flag(struct ch390_priv *dev)
 	return IRQF_TRIGGER_HIGH;
 }
 
+static bool ch390_irq_type_is_level(int irq_type)
+{
+	return irq_type == IRQF_TRIGGER_LOW || irq_type == IRQF_TRIGGER_HIGH;
+}
+
 static unsigned int ch390_intcr_value(struct ch390_priv *dev)
 {
-	return (ch390_irq_flag(dev) == IRQF_TRIGGER_LOW) ? INCR_POL_L :
-							   INCR_POL_H;
+	if (ch390_irq_flag(dev) == IRQF_TRIGGER_LOW)
+		return INCR_POL_L;
+
+	return INCR_POL_H;
 }
 
-static void ch390_get_rxctrl(struct ch390_priv *dev,
-			     struct ch390_rxctrl *rxctrl)
+static u8 ch390_compute_hash_bit(const u8 *mac)
 {
-	spin_lock_bh(&dev->rctl_lock);
-	*rxctrl = dev->rctl;
-	spin_unlock_bh(&dev->rctl_lock);
+	u32 crc = crc32_le(~0, mac, ETH_ALEN);
+
+	return bitrev32(~crc) >> 26;
 }
 
-static void ch390_set_rxctrl(struct ch390_priv *dev,
-			     const struct ch390_rxctrl *rxctrl)
+static void ch390_set_hash_bit(struct ch390_rxctrl *rxctrl, const u8 *mac)
 {
-	spin_lock_bh(&dev->rctl_lock);
-	dev->rctl = *rxctrl;
-	spin_unlock_bh(&dev->rctl_lock);
+	u8 bit = ch390_compute_hash_bit(mac);
+
+	rxctrl->hash_table[bit / 16] |= BIT(bit % 16);
 }
 
-static bool ch390_update_rxctrl(struct ch390_priv *dev,
-				const struct ch390_rxctrl *rxctrl)
+static int __ch390_set_rx_mode(struct net_device *ndev)
 {
-	bool changed;
-
-	spin_lock_bh(&dev->rctl_lock);
-	changed = !!memcmp(&dev->rctl, rxctrl, sizeof(*rxctrl));
-	if (changed)
-		dev->rctl = *rxctrl;
-	spin_unlock_bh(&dev->rctl_lock);
-
-	return changed;
-}
-
-static int ch390_set_recv(struct ch390_priv *dev,
-			  const struct ch390_rxctrl *rxctrl)
-{
+	struct ch390_priv *dev = to_ch390_priv(ndev);
+	struct netdev_hw_addr *ha;
+	struct ch390_rxctrl rxctrl;
+	u8 broadcast[ETH_ALEN];
 	int ret;
 
-	ret = ch390_set_regs(dev, CH390_MAR, rxctrl->hash_table,
-			     sizeof(rxctrl->hash_table), TYPE_U16);
+	netif_addr_lock_bh(ndev);
+
+	memset(&rxctrl, 0, sizeof(rxctrl));
+	rxctrl.rcr_all = RCR_DIS_CRC | RCR_RXEN;
+
+	eth_broadcast_addr(broadcast);
+	ch390_set_hash_bit(&rxctrl, broadcast);
+
+	if (ndev->flags & IFF_PROMISC) {
+		rxctrl.rcr_all |= RCR_PRMSC;
+	} else if (ndev->flags & IFF_ALLMULTI) {
+		rxctrl.rcr_all |= RCR_ALL;
+	} else {
+		netdev_for_each_mc_addr(ha, ndev)
+			ch390_set_hash_bit(&rxctrl, ha->addr);
+	}
+
+	netif_addr_unlock_bh(ndev);
+
+	ret = ch390_set_regs(dev, CH390_MAR, rxctrl.hash_table,
+			     sizeof(rxctrl.hash_table), TYPE_U16);
 	if (ret < 0)
 		return ret;
 
-	return ch390_set_reg(dev, CH390_RCR,
-			     rxctrl->rcr_all); /* enable rx */
-}
-
-static int ch390_restore_mac_filter(struct ch390_priv *dev,
-				    const struct ch390_rxctrl *rxctrl)
-{
-	struct net_device *ndev = dev->ndev;
-	int ret;
-
-	ret = ch390_set_regs(dev, CH390_PAR, ndev->dev_addr, ETH_ALEN,
-			     TYPE_U8);
-	if (ret < 0)
-		return ret;
-
-	return ch390_set_regs(dev, CH390_MAR, rxctrl->hash_table,
-			      sizeof(rxctrl->hash_table), TYPE_U16);
+	return ch390_set_reg(dev, CH390_RCR, rxctrl.rcr_all);
 }
 
 static int ch390_core_reset(struct ch390_priv *dev)
@@ -680,8 +670,7 @@ static int ch390_core_reset(struct ch390_priv *dev)
 	if (ret < 0)
 		return ret;
 
-	ret = ch390_set_reg(dev, CH390_MLEDCR,
-			    dev->lcr_all); /* LEDMode1 */
+	ret = ch390_set_reg(dev, CH390_MLEDCR, dev->lcr_all); /* LEDMode1 */
 	if (ret < 0)
 		return ret;
 
@@ -776,6 +765,7 @@ out:
 static int ch390_phyread(void *context, u8 reg, unsigned int *val)
 {
 	struct ch390_priv *dev = context;
+	u16 phy_val;
 	int ret;
 
 	mutex_lock(&dev->phy_mutex);
@@ -796,9 +786,12 @@ static int ch390_phyread(void *context, u8 reg, unsigned int *val)
 	if (ret < 0)
 		goto out;
 
-	*val = 0;
+	phy_val = 0;
 
-	ret = ch390_get_regs(dev, CH390_EPDRL, val, 2, TYPE_U16);
+	ret = ch390_get_regs(dev, CH390_EPDRL, &phy_val, sizeof(phy_val),
+			     TYPE_U16);
+	if (!ret)
+		*val = phy_val;
 
 out:
 	mutex_unlock(&dev->phy_mutex);
@@ -842,7 +835,10 @@ static int ch390_mdio_read(struct mii_bus *bus, int addr, int regnum)
 	int ret;
 
 	if (addr == CH390_PHY_ADDR) {
-		ret = ch390_phyread(dev, regnum, &val);
+		if (regnum < 0 || regnum > CH390_MDIO_C22_REG_MAX)
+			return -EINVAL;
+
+		ret = ch390_phyread(dev, (u8)regnum, &val);
 		if (ret < 0)
 			return ret;
 	}
@@ -850,38 +846,40 @@ static int ch390_mdio_read(struct mii_bus *bus, int addr, int regnum)
 	return val;
 }
 
-static int ch390_mdio_write(struct mii_bus *bus, int addr, int regnum,
-			    u16 val)
+static int ch390_mdio_write(struct mii_bus *bus, int addr, int regnum, u16 val)
 {
 	struct ch390_priv *dev = bus->priv;
 
 	if (addr != CH390_PHY_ADDR)
 		return -ENODEV;
 
+	if (regnum < 0 || regnum > CH390_MDIO_C22_REG_MAX)
+		return -EINVAL;
+
 	if ((regnum == MII_BMCR) && (val & BMCR_RESET))
 		return 0;
 
-	return ch390_phywrite(dev, regnum, val);
+	return ch390_phywrite(dev, (u8)regnum, val);
 }
 
 static int ch390_page_read(struct ch390_priv *dev, int page, int regnum)
 {
 	struct mii_bus *bus = dev->mdiobus;
-	int ret, restore_ret;
+	int ret;
 
 	mutex_lock(&bus->mdio_lock);
 
-	ret = ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PAG_SEL,
-			       page);
+	ret = ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PAG_SEL, page);
 	if (ret < 0)
 		goto out_unlock;
 
 	ret = ch390_mdio_read(bus, CH390_PHY_ADDR, regnum);
+	if (ret < 0)
+		netdev_err(dev->ndev, "error %d reading PHY page %d reg %d\n",
+			   ret, page, regnum);
 
-	restore_ret = ch390_mdio_write(bus, CH390_PHY_ADDR,
-				       CH390_PHY_PAG_SEL, CH390_PHY_PAGE0);
-	if (ret >= 0 && restore_ret < 0)
-		ret = restore_ret;
+	ret = ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PAG_SEL,
+			       CH390_PHY_PAGE0);
 
 out_unlock:
 	mutex_unlock(&bus->mdio_lock);
@@ -929,8 +927,8 @@ static int ch390_map_etherdev_par(struct net_device *ndev,
 		random_ether_addr(ndev->dev_addr);
 #endif
 
-		ret = ch390_set_regs(dev, CH390_PAR, ndev->dev_addr,
-				     ETH_ALEN, TYPE_U8);
+		ret = ch390_set_regs(dev, CH390_PAR, ndev->dev_addr, ETH_ALEN,
+				     TYPE_U8);
 		if (ret < 0)
 			return ret;
 
@@ -963,8 +961,7 @@ static void ch390_get_drvinfo(struct net_device *ndev,
 }
 
 #if (LINUX_VERSION_CODE <= KERNEL_VERSION(4, 5, 0))
-static int ch390_get_settings(struct net_device *ndev,
-			      struct ethtool_cmd *cmd)
+static int ch390_get_settings(struct net_device *ndev, struct ethtool_cmd *cmd)
 {
 	if (!ndev->phydev)
 		return -ENODEV;
@@ -972,8 +969,7 @@ static int ch390_get_settings(struct net_device *ndev,
 	return phy_ethtool_gset(ndev->phydev, cmd);
 }
 
-static int ch390_set_settings(struct net_device *ndev,
-			      struct ethtool_cmd *cmd)
+static int ch390_set_settings(struct net_device *ndev, struct ethtool_cmd *cmd)
 {
 	if (!ndev->phydev)
 		return -ENODEV;
@@ -1012,8 +1008,8 @@ static int ch390_get_eeprom_len(struct net_device *ndev)
 	return 128;
 }
 
-static int ch390_get_eeprom(struct net_device *ndev,
-			    struct ethtool_eeprom *ee, u8 *data)
+static int ch390_get_eeprom(struct net_device *ndev, struct ethtool_eeprom *ee,
+			    u8 *data)
 {
 	struct ch390_priv *dev = to_ch390_priv(ndev);
 	int offset = ee->offset;
@@ -1033,8 +1029,8 @@ static int ch390_get_eeprom(struct net_device *ndev,
 	return ret;
 }
 
-static int ch390_set_eeprom(struct net_device *ndev,
-			    struct ethtool_eeprom *ee, u8 *data)
+static int ch390_set_eeprom(struct net_device *ndev, struct ethtool_eeprom *ee,
+			    u8 *data)
 {
 	struct ch390_priv *dev = to_ch390_priv(ndev);
 	int offset = ee->offset;
@@ -1094,11 +1090,40 @@ static int ch390_set_pauseparam(struct net_device *ndev,
 	else
 		advertise &= ~ADVERTISE_PAUSE_ASYM;
 
-	mdiobus_write(dev->mdiobus, CH390_PHY_ADDR, MII_ADVERTISE,
-		      advertise);
+	mdiobus_write(dev->mdiobus, CH390_PHY_ADDR, MII_ADVERTISE, advertise);
 #endif
 	phy_start_aneg(dev->phydev);
 	return 0;
+}
+
+static void ch390_get_strings(struct net_device *ndev, u32 stringset, u8 *data)
+{
+	if (stringset == ETH_SS_STATS)
+		memcpy(data, ch390_gstrings, sizeof(ch390_gstrings));
+}
+
+static int ch390_get_sset_count(struct net_device *ndev, int sset)
+{
+	switch (sset) {
+	case ETH_SS_STATS:
+		return ARRAY_SIZE(ch390_gstrings);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static void ch390_get_ethtool_stats(struct net_device *ndev,
+				    struct ethtool_stats *stats, u64 *data)
+{
+	struct ch390_priv *dev = to_ch390_priv(ndev);
+
+	data[0] = dev->set_phypn_triggers;
+	data[1] = dev->linkup_restarts;
+	data[2] = dev->bc.status_err_counter;
+	data[3] = dev->bc.large_err_counter;
+	data[4] = dev->bc.rx_err_counter;
+	data[5] = dev->bc.tx_err_counter;
+	data[6] = dev->bc.fifo_rst_counter;
 }
 
 static const struct ethtool_ops ch390_ethtool_ops = {
@@ -1123,6 +1148,9 @@ static const struct ethtool_ops ch390_ethtool_ops = {
 	.set_eeprom = ch390_set_eeprom,
 	.get_pauseparam = ch390_get_pauseparam,
 	.set_pauseparam = ch390_set_pauseparam,
+	.get_strings = ch390_get_strings,
+	.get_sset_count = ch390_get_sset_count,
+	.get_ethtool_stats = ch390_get_ethtool_stats,
 };
 
 static void ch390_enable_pwrsave(struct ch390_priv *dev)
@@ -1144,45 +1172,44 @@ static void ch390_enable_pwrsave(struct ch390_priv *dev)
 	}
 
 	val |= CH390_PHY_ENPWR_SAVE;
-	ret = ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PWR_SAVE,
-			       val);
+	ret = ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PWR_SAVE, val);
 
 out_unlock:
 	mutex_unlock(&bus->mdio_lock);
 	if (ret < 0)
-		netdev_err(dev->ndev,
-			   "failed to enable PHY power save: %d\n", ret);
+		netdev_err(dev->ndev, "failed to enable PHY power save: %d\n",
+			   ret);
 }
 
 static int ch390_all_start(struct ch390_priv *dev, bool enable_interrupt)
 {
-	struct ch390_rxctrl rxctrl;
 	int ret;
+
+	ch390_lock_epcr_users(dev);
 
 	ret = ch390_core_reset(dev);
 	if (ret < 0)
-		return ret;
+		goto out_epcr_unlock;
 
 	ret = ch390_disable_interrupt(dev);
 	if (ret < 0)
-		return ret;
+		goto out_epcr_unlock;
 
 	/*
 	 * After ch390_core_reset phy must be reopen
 	 */
 	ret = ch390_set_reg(dev, CH390_GPR, 0);
 	if (ret < 0)
-		return ret;
+		goto out_epcr_unlock;
 
 	msleep(1);
 
-	ch390_enable_pwrsave(dev);
-
-	ch390_get_rxctrl(dev, &rxctrl);
-
-	ret = ch390_restore_mac_filter(dev, &rxctrl);
+out_epcr_unlock:
+	ch390_unlock_epcr_users(dev);
 	if (ret < 0)
 		return ret;
+
+	ch390_enable_pwrsave(dev);
 
 	ret = ch390_update_fcr(dev);
 	if (ret < 0)
@@ -1192,7 +1219,7 @@ static int ch390_all_start(struct ch390_priv *dev, bool enable_interrupt)
 	if (ret < 0)
 		return ret;
 
-	ret = ch390_set_reg(dev, CH390_RCR, rxctrl.rcr_all);
+	ret = __ch390_set_rx_mode(dev->ndev);
 	if (ret < 0)
 		return ret;
 
@@ -1211,23 +1238,26 @@ static int ch390_all_stop(struct ch390_priv *dev)
 {
 	int ret;
 
+	ch390_lock_epcr_users(dev);
+
 	/*
 	 * GPR power off of the internal phy,
 	 * the internal phy still could be accessed after this GPR power off control
 	 */
 	ret = ch390_set_reg(dev, CH390_GPR, GPR_PHYPD);
 	if (ret < 0)
-		return ret;
+		goto out_unlock;
 
-	return ch390_set_reg(dev, CH390_RCR, RCR_DIS_CRC);
+	ret = ch390_set_reg(dev, CH390_RCR, RCR_DIS_CRC);
+
+out_unlock:
+	ch390_unlock_epcr_users(dev);
+	return ret;
 }
 
 static int ch390_reset_rx_fifo(struct ch390_priv *dev)
 {
-	struct ch390_rxctrl rxctrl;
 	int ret;
-
-	ch390_get_rxctrl(dev, &rxctrl);
 
 	ret = ch390_set_reg(dev, CH390_RCR, 0);
 	if (ret < 0)
@@ -1243,15 +1273,28 @@ static int ch390_reset_rx_fifo(struct ch390_priv *dev)
 
 	msleep(1);
 
-	return ch390_set_reg(dev, CH390_RCR, rxctrl.rcr_all);
+	return __ch390_set_rx_mode(dev->ndev);
+}
+
+static int ch390_read_rx_ready(struct ch390_priv *dev, u8 *rxbyte)
+{
+	u8 ready[CH390_RX_READY_BYTES];
+	int ret;
+
+	ret = ch390_read_mem(dev, OPC_MEM_DMY_R, ready, sizeof(ready));
+	if (ret < 0)
+		return ret;
+
+	*rxbyte = ready[CH390_RX_READY_VALID_OFFSET];
+
+	return 0;
 }
 
 /*
  * read packets from the fifo memory
  * return value:
- *  > 0 - read packet number, caller can repeat the rx operation
- *    0 - no error, caller need stop further rx operation
- *  -EBUSY - read data error, caller escape from rx operation
+ *    0 - rx fifo drained or stop requested
+ *   <0 - read data error, caller escape from rx operation
  */
 static int ch390_loop_rx(struct ch390_priv *dev)
 {
@@ -1260,14 +1303,9 @@ static int ch390_loop_rx(struct ch390_priv *dev)
 	int ret, rxlen;
 	struct sk_buff *skb;
 	u8 *rdptr;
-	int scanrr = 0;
 
-	do {
-		ret = ch390_get_reg(dev, OPC_MEM_DMY_R, &rxbyte);
-		if (ret < 0)
-			return ret;
-
-		ret = ch390_get_reg(dev, OPC_MEM_DMY_R, &rxbyte);
+	while (!test_bit(CH390_DEV_STOPPING, &dev->flags)) {
+		ret = ch390_read_rx_ready(dev, &rxbyte);
 		if (ret < 0)
 			return ret;
 
@@ -1276,7 +1314,7 @@ static int ch390_loop_rx(struct ch390_priv *dev)
 			if (ret < 0)
 				return ret;
 
-			return scanrr; /* packet-erro */
+			return 0; /* packet-erro */
 		}
 
 		if (rxbyte != CH390_PKT_RDY)
@@ -1296,14 +1334,13 @@ static int ch390_loop_rx(struct ch390_priv *dev)
 				   dev->rxhdr.headbyte);
 
 			dev->bc.large_err_counter++;
-			netdev_dbg(ndev, "check rxlen-error (%d)\n",
-				   rxlen);
+			netdev_dbg(ndev, "check rxlen-error (%d)\n", rxlen);
 
 			ret = ch390_reset_rx_fifo(dev);
 			if (ret < 0)
 				return ret;
 
-			return scanrr;
+			return 0;
 		}
 
 		if (dev->rxhdr.status & RSR_ERR_BITS) {
@@ -1313,24 +1350,24 @@ static int ch390_loop_rx(struct ch390_priv *dev)
 			netdev_dbg(ndev, "check rxstatus-error (%02x)\n",
 				   dev->rxhdr.status);
 
-			ret = ch390_dumpblk(dev, OPC_MEM_READ, rxlen);
+			ret = ch390_read_mem(dev, OPC_MEM_READ, NULL, rxlen);
 			if (ret < 0) {
 				ch390_reset_rx_fifo(dev);
 				return ret;
 			}
 
-			return scanrr;
+			continue;
 		}
 
 		skb = netdev_alloc_skb_ip_align(ndev, rxlen);
 		if (!skb) {
-			ret = ch390_dumpblk(dev, OPC_MEM_READ, rxlen);
+			ret = ch390_read_mem(dev, OPC_MEM_READ, NULL, rxlen);
 			if (ret < 0) {
 				ch390_reset_rx_fifo(dev);
 				return ret;
 			}
 
-			return scanrr;
+			continue;
 		}
 
 		/* Read the appended CRC to advance FIFO, then trim it away. */
@@ -1348,17 +1385,19 @@ static int ch390_loop_rx(struct ch390_priv *dev)
 		skb->protocol = eth_type_trans(skb, dev->ndev);
 		if (dev->ndev->features & NETIF_F_RXCSUM)
 			skb_checksum_none_assert(skb);
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0))
 		netif_rx(skb);
+#else
+		netif_rx_ni(skb);
+#endif
 		dev->ndev->stats.rx_bytes += rxlen - 4;
 		dev->ndev->stats.rx_packets++;
-		scanrr++;
-	} while (!ret);
+	}
 
-	return scanrr;
+	return 0;
 }
 
-static int ch390_single_tx(struct ch390_priv *dev, u8 *buff,
-			   unsigned int len)
+static int ch390_single_tx(struct ch390_priv *dev, u8 *buff, unsigned int len)
 {
 	int ret;
 	unsigned int temp_low = len & 0xff;
@@ -1371,13 +1410,8 @@ static int ch390_single_tx(struct ch390_priv *dev, u8 *buff,
 	ret = ch390_wait_for_condition(dev, CH390_TCR, TCR_TXREQ,
 				       CH390_TX_TIMEOUT_US,
 				       CH390_TX_POLL_DELAY_US);
-	if (ret < 0) {
-		if (ret == -ETIMEDOUT)
-			netdev_err(
-				dev->ndev,
-				"timeout waiting for TX request to clear\n");
+	if (ret < 0)
 		return ret;
-	}
 
 	ret = ch390_set_reg(dev, CH390_TXPLL, temp_low);
 	if (ret < 0)
@@ -1390,69 +1424,69 @@ static int ch390_single_tx(struct ch390_priv *dev, u8 *buff,
 	return ch390_set_reg(dev, CH390_TCR, TCR_TXREQ);
 }
 
-static void ch390_tx_queue_done(struct ch390_priv *dev, bool force_wake)
-{
-	struct net_device *ndev = dev->ndev;
-
-	if (netif_queue_stopped(ndev) &&
-	    (force_wake ||
-	     skb_queue_len(&dev->txq) < CH390_TX_QUE_LO_WATER))
-		netif_wake_queue(ndev);
-}
-
-static void ch390_tx_error_requeue(struct ch390_priv *dev)
-{
-	ch390_tx_queue_done(dev, true);
-
-	if (netif_running(dev->ndev) && !skb_queue_empty(&dev->txq))
-		schedule_work(&dev->tx_work);
-}
-
 static int ch390_loop_tx(struct ch390_priv *dev)
 {
 	struct net_device *ndev = dev->ndev;
+	struct sk_buff *skb;
 	int ntx = 0;
 	int ret;
 
-	while (!skb_queue_empty(&dev->txq)) {
-		struct sk_buff *skb;
-		unsigned int len;
+	if (test_bit(CH390_DEV_STOPPING, &dev->flags))
+		return 0;
 
-		skb = skb_dequeue(&dev->txq);
-		if (skb) {
-			ntx++;
-			len = skb->len;
-
-			if (skb_cow_head(skb, CH390_TX_OVERHEAD)) {
-				dev_kfree_skb(skb);
-				dev->bc.tx_err_counter++;
-				ch390_tx_error_requeue(dev);
-				return 0;
-			}
-
-			skb_push(skb, CH390_TX_OVERHEAD);
-			skb->data[0] = OPC_MEM_WRITE;
-			ret = ch390_single_tx(dev, skb->data, len);
+	if (!netif_carrier_ok(ndev)) {
+		while ((skb = skb_dequeue(&dev->txq))) {
 			dev_kfree_skb(skb);
-
-			if (ret < 0) {
-				int restart_ret;
-
-				dev->bc.tx_err_counter++;
-				restart_ret = ch390_all_restart(dev);
-				if (restart_ret < 0) {
-					ch390_tx_queue_done(dev, true);
-					return restart_ret;
-				}
-				ch390_tx_error_requeue(dev);
-				return ret;
-			}
-
-			ndev->stats.tx_bytes += len;
-			ndev->stats.tx_packets++;
+			ndev->stats.tx_dropped++;
 		}
 
-		ch390_tx_queue_done(dev, false);
+		return 0;
+	}
+
+	while ((skb = skb_dequeue(&dev->txq))) {
+		unsigned int len;
+
+		len = skb->len;
+
+		if (skb_cow_head(skb, CH390_TX_OVERHEAD)) {
+			ntx++;
+			dev_kfree_skb(skb);
+			dev->bc.tx_err_counter++;
+			ndev->stats.tx_errors++;
+			ndev->stats.tx_dropped++;
+			if (netif_queue_stopped(ndev) &&
+			    skb_queue_len(&dev->txq) < CH390_TX_QUE_LO_WATER)
+				netif_wake_queue(ndev);
+			return ntx;
+		}
+
+		if (test_bit(CH390_DEV_STOPPING, &dev->flags) ||
+		    !netif_carrier_ok(ndev)) {
+			skb_queue_head(&dev->txq, skb);
+			return ntx;
+		}
+
+		ntx++;
+		skb_push(skb, CH390_TX_OVERHEAD);
+		skb->data[0] = OPC_MEM_WRITE;
+		ret = ch390_single_tx(dev, skb->data, len);
+		dev_kfree_skb(skb);
+
+		if (ret < 0) {
+			dev->bc.tx_err_counter++;
+			ndev->stats.tx_errors++;
+			ndev->stats.tx_dropped++;
+			netif_stop_queue(ndev);
+			return ret;
+		}
+
+		/* start_xmit only queues the skb; refresh watchdog on real SPI TX. */
+		netif_trans_update(ndev);
+		ndev->stats.tx_bytes += len;
+		ndev->stats.tx_packets++;
+		if (netif_queue_stopped(ndev) &&
+		    skb_queue_len(&dev->txq) < CH390_TX_QUE_LO_WATER)
+			netif_wake_queue(ndev);
 	}
 
 	return ntx;
@@ -1461,73 +1495,104 @@ static int ch390_loop_tx(struct ch390_priv *dev)
 static irqreturn_t ch390_rx_threaded_irq(int irq, void *pw)
 {
 	struct ch390_priv *dev = pw;
-	int ret, ret_tx;
+	bool tx_pending;
+	int ret;
 
 	mutex_lock(&dev->spi_lockm);
 
-	ret = ch390_disable_interrupt(dev);
-	if (ret < 0)
+	if (test_bit(CH390_DEV_STOPPING, &dev->flags))
 		goto out_unlock;
 
 	ret = ch390_clear_interrupt(dev);
 	if (ret < 0)
 		goto out_unlock;
 
-	do {
-		ret = ch390_loop_rx(dev); /* threaded irq rx */
-		if (ret < 0)
-			goto out_unlock;
-
-		/* more tx better performance */
-		ret_tx = ch390_loop_tx(dev);
-		if (ret_tx < 0)
-			goto out_unlock;
-	} while (ret > 0);
+	ret = ch390_loop_rx(dev); /* threaded irq rx */
+	if (ret < 0)
+		goto out_unlock;
 
 	/*
-	 * To exit and has mutex unlock while rx or tx error
+	 * To exit and has mutex unlock while rx error
 	 */
 out_unlock:
-	if (netif_running(dev->ndev))
-		ch390_enable_interrupt(dev);
+	tx_pending = !skb_queue_empty(&dev->txq);
 	mutex_unlock(&dev->spi_lockm);
+
+	if (tx_pending)
+		queue_work(dev->wq, &dev->tx_work);
 
 	return IRQ_HANDLED;
 }
 
 static void ch390_tx_delay(struct work_struct *work)
 {
-	struct ch390_priv *dev =
-		container_of(work, struct ch390_priv, tx_work);
+	struct ch390_priv *dev = container_of(work, struct ch390_priv, tx_work);
+	bool tx_pending;
 	int ret;
 
 	mutex_lock(&dev->spi_lockm);
+
+	if (test_bit(CH390_DEV_STOPPING, &dev->flags)) {
+		mutex_unlock(&dev->spi_lockm);
+		return;
+	}
 
 	ret = ch390_loop_tx(dev);
 	if (ret < 0)
 		netdev_err(dev->ndev, "transmit packet error\n");
+	tx_pending = ret >= 0 && !skb_queue_empty(&dev->txq);
 
 	mutex_unlock(&dev->spi_lockm);
+
+	if (tx_pending)
+		queue_work(dev->wq, &dev->tx_work);
 }
 
-static void ch390_rxctl_delay(struct work_struct *work)
+static void ch390_tx_timeout_work(struct work_struct *work)
 {
 	struct ch390_priv *dev =
-		container_of(work, struct ch390_priv, rxctrl_work);
-	struct net_device *ndev = dev->ndev;
-	struct ch390_rxctrl rxctrl;
+		container_of(work, struct ch390_priv, tx_timeout_work);
+	bool tx_pending = false;
 	int ret;
-
-	ch390_get_rxctrl(dev, &rxctrl);
 
 	mutex_lock(&dev->spi_lockm);
 
-	ret = ch390_set_regs(dev, CH390_PAR, ndev->dev_addr, ETH_ALEN,
-			     TYPE_U8);
-	if (ret < 0)
+	if (test_bit(CH390_DEV_STOPPING, &dev->flags))
 		goto out_unlock;
 
-	ch390_set_recv(dev, &rxctrl);
+	ret = ch390_all_restart(dev);
+	if (ret < 0) {
+		netdev_err(dev->ndev, "failed to recover TX timeout: %d\n",
+			   ret);
+		goto out_unlock;
+	}
+
+	if (netif_running(dev->ndev) && netif_carrier_ok(dev->ndev) &&
+	    netif_queue_stopped(dev->ndev))
+		netif_wake_queue(dev->ndev);
+	tx_pending = !skb_queue_empty(&dev->txq);
+
+out_unlock:
+	mutex_unlock(&dev->spi_lockm);
+
+	if (tx_pending)
+		queue_work(dev->wq, &dev->tx_work);
+}
+
+static void ch390_rx_mode_delay(struct work_struct *work)
+{
+	struct ch390_priv *dev =
+		container_of(work, struct ch390_priv, rx_mode_work);
+	int ret;
+
+	mutex_lock(&dev->spi_lockm);
+
+	if (test_bit(CH390_DEV_STOPPING, &dev->flags))
+		goto out_unlock;
+
+	ret = __ch390_set_rx_mode(dev->ndev);
+	if (ret < 0)
+		netdev_err(dev->ndev, "failed to apply rx mode: %d\n", ret);
 
 out_unlock:
 	mutex_unlock(&dev->spi_lockm);
@@ -1543,15 +1608,14 @@ static int ch390_request_irq(struct ch390_priv *dev);
 static int ch390_open(struct net_device *ndev)
 {
 	struct ch390_priv *dev = to_ch390_priv(ndev);
-	struct ch390_rxctrl rxctrl;
 	int ret;
+
+	netif_stop_queue(ndev);
+	netif_carrier_off(ndev);
+	clear_bit(CH390_DEV_STOPPING, &dev->flags);
 
 	dev->imr_all = IMR_PAR | IMR_PRI;
 	dev->lcr_all = MLEDCR_LED_MOD1;
-
-	memset(&rxctrl, 0, sizeof(rxctrl));
-	rxctrl.rcr_all = RCR_DIS_CRC | RCR_RXEN;
-	ch390_set_rxctrl(dev, &rxctrl);
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0))
 	phy_support_sym_pause(dev->phydev);
@@ -1573,14 +1637,17 @@ static int ch390_open(struct net_device *ndev)
 	mutex_lock(&dev->spi_lockm);
 	ret = ch390_all_start(dev, false);
 	mutex_unlock(&dev->spi_lockm);
-	if (ret < 0)
+	if (ret < 0) {
+		set_bit(CH390_DEV_STOPPING, &dev->flags);
 		return ret;
+	}
 
 	ret = ch390_request_irq(dev);
 	if (ret < 0) {
 		mutex_lock(&dev->spi_lockm);
 		ch390_all_stop(dev);
 		mutex_unlock(&dev->spi_lockm);
+		set_bit(CH390_DEV_STOPPING, &dev->flags);
 		return ret;
 	}
 
@@ -1592,14 +1659,16 @@ static int ch390_open(struct net_device *ndev)
 		mutex_lock(&dev->spi_lockm);
 		ch390_all_stop(dev);
 		mutex_unlock(&dev->spi_lockm);
+		set_bit(CH390_DEV_STOPPING, &dev->flags);
 		return ret;
 	}
 
 	phy_start(dev->phydev);
-	netif_wake_queue(ndev);
 
-	WRITE_ONCE(dev->linkup_check_active, false);
-	WRITE_ONCE(dev->check_flag, true);
+	clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+	clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
+	set_bit(CH390_LINK_CHECK_ENABLED, &dev->flags);
 	mod_delayed_work(dev->wq, &dev->linkdn_work,
 			 msecs_to_jiffies(CH390_LINK_DOWN_INTVAL_MS));
 
@@ -1618,30 +1687,36 @@ static int ch390_stop(struct net_device *ndev)
 	int ret, stop_ret;
 
 	netif_stop_queue(ndev);
-	WRITE_ONCE(dev->check_flag, false);
-	WRITE_ONCE(dev->linkup_check_active, false);
+	netif_carrier_off(ndev);
+	set_bit(CH390_DEV_STOPPING, &dev->flags);
+	clear_bit(CH390_LINK_CHECK_ENABLED, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+	clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
 	cancel_delayed_work_sync(&dev->linkdn_work);
 	cancel_delayed_work_sync(&dev->linkup_work);
 
 	mutex_lock(&dev->spi_lockm);
 	ret = ch390_disable_interrupt(dev);
+	stop_ret = ch390_all_stop(dev);
 	mutex_unlock(&dev->spi_lockm);
 
 	free_irq(dev->spidev->irq, dev);
 
-	flush_work(&dev->tx_work);
-	flush_work(&dev->rxctrl_work);
+	cancel_work_sync(&dev->tx_work);
+	cancel_work_sync(&dev->tx_timeout_work);
+	cancel_work_sync(&dev->rx_mode_work);
 
 	phy_stop(dev->phydev);
-
-	stop_ret = ch390_all_stop(dev);
 
 	skb_queue_purge(&dev->txq);
 
 	if (ret < 0)
-		return ret;
+		netdev_warn(ndev,
+			    "failed to disable interrupts during stop: %d\n",
+			    ret);
 	if (stop_ret < 0)
-		return stop_ret;
+		netdev_warn(ndev, "failed to stop hardware: %d\n", stop_ret);
 
 	return 0;
 }
@@ -1654,11 +1729,17 @@ static netdev_tx_t ch390_start_xmit(struct sk_buff *skb,
 {
 	struct ch390_priv *dev = to_ch390_priv(ndev);
 
+	if (unlikely(test_bit(CH390_DEV_STOPPING, &dev->flags))) {
+		dev_kfree_skb(skb);
+		ndev->stats.tx_dropped++;
+		return NETDEV_TX_OK;
+	}
+
 	skb_queue_tail(&dev->txq, skb);
 	if (skb_queue_len(&dev->txq) > CH390_TX_QUE_HI_WATER)
 		netif_stop_queue(ndev); /* enforce limit queue size */
 
-	schedule_work(&dev->tx_work);
+	queue_work(dev->wq, &dev->tx_work);
 
 	return NETDEV_TX_OK;
 }
@@ -1669,49 +1750,28 @@ static netdev_tx_t ch390_start_xmit(struct sk_buff *skb,
 static void ch390_set_rx_mode(struct net_device *ndev)
 {
 	struct ch390_priv *dev = to_ch390_priv(ndev);
-	struct ch390_rxctrl rxctrl;
-	struct netdev_hw_addr *ha;
-	u8 rcr = RCR_DIS_CRC | RCR_RXEN;
-	u32 hash_val;
 
-	memset(&rxctrl, 0, sizeof(rxctrl));
+	if (!test_bit(CH390_DEV_STOPPING, &dev->flags))
+		queue_work(dev->wq, &dev->rx_mode_work);
+}
 
-	/* rx control */
-	if (ndev->flags & IFF_PROMISC) {
-		rcr |= RCR_PRMSC;
-		netdev_dbg(ndev,
-			   "set_multicast rcr |= RCR_PRMSC, rcr= %02x\n",
-			   rcr);
-	}
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0))
+static void ch390_tx_timeout(struct net_device *ndev, unsigned int txqueue)
+#else
+static void ch390_tx_timeout(struct net_device *ndev)
+#endif
+{
+	struct ch390_priv *dev = to_ch390_priv(ndev);
 
-	if (ndev->flags & IFF_ALLMULTI) {
-		rcr |= RCR_ALL;
-		netdev_dbg(
-			ndev,
-			"set_multicast rcr |= RCR_ALLMULTI, rcr= %02x\n",
-			rcr);
-	}
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0))
+	(void)txqueue;
+#endif
 
-	rxctrl.rcr_all = rcr;
+	dev->bc.tx_err_counter++;
+	ndev->stats.tx_errors++;
 
-	/* broadcast address */
-	rxctrl.hash_table[0] = 0;
-	rxctrl.hash_table[1] = 0;
-	rxctrl.hash_table[2] = 0;
-	rxctrl.hash_table[3] = 0x8000;
-
-	/* the multicast address in Hash Table : 64 bits */
-	netdev_for_each_mc_addr(ha, ndev) {
-		hash_val = crc32_le(~0, ha->addr, ETH_ALEN) &
-			   GENMASK(5, 0);
-		rxctrl.hash_table[hash_val / 16] |= BIT(0)
-						    << (hash_val % 16);
-	}
-
-	/* schedule work to do the actual set of the data if needed */
-
-	if (ch390_update_rxctrl(dev, &rxctrl))
-		schedule_work(&dev->rxctrl_work);
+	if (!test_bit(CH390_DEV_STOPPING, &dev->flags))
+		queue_work(dev->wq, &dev->tx_timeout_work);
 }
 
 /*
@@ -1721,24 +1781,28 @@ static int ch390_set_mac_address(struct net_device *ndev, void *p)
 {
 	struct ch390_priv *dev = to_ch390_priv(ndev);
 	struct sockaddr *addr = p;
+	int ret;
 
-	if (!(ndev->priv_flags & IFF_LIVE_ADDR_CHANGE) &&
-	    netif_running(ndev))
+	if (!(ndev->priv_flags & IFF_LIVE_ADDR_CHANGE) && netif_running(ndev))
 		return -EBUSY;
 	if (!is_valid_ether_addr(addr->sa_data))
 		return -EADDRNOTAVAIL;
+
+	mutex_lock(&dev->spi_lockm);
+	ret = ch390_set_regs(dev, CH390_PAR, addr->sa_data, ETH_ALEN, TYPE_U8);
+	mutex_unlock(&dev->spi_lockm);
+	if (ret < 0)
+		return ret;
 
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0))
 	eth_commit_mac_addr_change(ndev, p);
 #else
 	memcpy(ndev->dev_addr, addr->sa_data, ndev->addr_len);
 #endif
-	return ch390_set_regs(dev, CH390_PAR, ndev->dev_addr, ETH_ALEN,
-			      TYPE_U8);
+	return 0;
 }
 
-static int ch390_do_ioctl(struct net_device *ndev, struct ifreq *ifr,
-			  int cmd)
+static int ch390_do_ioctl(struct net_device *ndev, struct ifreq *ifr, int cmd)
 {
 	struct ch390_priv *priv = netdev_priv(ndev);
 	struct mii_ioctl_data *mii = if_mii(ifr);
@@ -1753,16 +1817,15 @@ static int ch390_do_ioctl(struct net_device *ndev, struct ifreq *ifr,
 		return 0;
 
 	case SIOCGMIIREG:
-		ret = mdiobus_read(priv->mdiobus, mii->phy_id,
-				   mii->reg_num);
+		ret = mdiobus_read(priv->mdiobus, mii->phy_id, mii->reg_num);
 		if (ret < 0)
 			return ret;
 		mii->val_out = ret;
 		return 0;
 
 	case SIOCSMIIREG:
-		return mdiobus_write(priv->mdiobus, mii->phy_id,
-				     mii->reg_num, mii->val_in);
+		return mdiobus_write(priv->mdiobus, mii->phy_id, mii->reg_num,
+				     mii->val_in);
 
 	default:
 		return -EOPNOTSUPP;
@@ -1773,6 +1836,7 @@ static const struct net_device_ops ch390_netdev_ops = {
 	.ndo_open = ch390_open,
 	.ndo_stop = ch390_stop,
 	.ndo_start_xmit = ch390_start_xmit,
+	.ndo_tx_timeout = ch390_tx_timeout,
 	.ndo_set_rx_mode = ch390_set_rx_mode,
 	.ndo_validate_addr = eth_validate_addr,
 	.ndo_set_mac_address = ch390_set_mac_address,
@@ -1839,22 +1903,37 @@ static void ch390_handle_link_change(struct net_device *ndev)
 
 	phy_print_status(dev->phydev);
 
+	if (test_bit(CH390_DEV_STOPPING, &dev->flags) || !netif_running(ndev)) {
+		netif_stop_queue(ndev);
+		netif_carrier_off(ndev);
+		clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+		clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
+		return;
+	}
+
 	/*
 	 * only write pause settings to mac. since mac and phy are integrated
 	 * together, such as link state, speed and duplex are sync already
 	 */
 	if (dev->phydev->link) {
+		netif_carrier_on(ndev);
+		clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+
 		if (dev->pause.autoneg == AUTONEG_ENABLE) {
 			dev->pause.rx_pause = dev->phydev->pause;
 			dev->pause.tx_pause = dev->phydev->pause;
 		}
 
-		mutex_lock(&dev->spi_lockm);
-		ch390_update_fcr(dev);
-		mutex_unlock(&dev->spi_lockm);
+		if (netif_queue_stopped(ndev))
+			netif_wake_queue(ndev);
 
-		if (READ_ONCE(dev->check_flag)) {
-			WRITE_ONCE(dev->linkup_check_active, true);
+		if (mutex_trylock(&dev->spi_lockm)) {
+			ch390_update_fcr(dev);
+			mutex_unlock(&dev->spi_lockm);
+		}
+
+		if (test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags)) {
+			set_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
 			if (!delayed_work_pending(&dev->linkup_work) &&
 			    !work_busy(&dev->linkup_work.work))
 				mod_delayed_work(
@@ -1864,14 +1943,16 @@ static void ch390_handle_link_change(struct net_device *ndev)
 		}
 		cancel_delayed_work_sync(&dev->linkdn_work);
 	} else {
-		WRITE_ONCE(dev->linkup_check_active, false);
+		netif_stop_queue(ndev);
+		netif_carrier_off(ndev);
+		clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+		clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
 		if (!delayed_work_pending(&dev->linkdn_work) &&
 		    !work_busy(&dev->linkdn_work.work) &&
-		    READ_ONCE(dev->check_flag))
+		    test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags))
 			mod_delayed_work(
 				dev->wq, &dev->linkdn_work,
-				msecs_to_jiffies(
-					CH390_LINK_DOWN_INTVAL_MS));
+				msecs_to_jiffies(CH390_LINK_DOWN_INTVAL_MS));
 		cancel_delayed_work_sync(&dev->linkup_work);
 	}
 }
@@ -1888,8 +1969,7 @@ static int ch390_phy_connect(struct ch390_priv *dev)
 	if (!phydev)
 		return -ENODEV;
 
-	ret = phy_connect_direct(dev->ndev, phydev,
-				 ch390_handle_link_change,
+	ret = phy_connect_direct(dev->ndev, phydev, ch390_handle_link_change,
 				 PHY_INTERFACE_MODE_MII);
 	if (ret)
 		return ret;
@@ -1905,9 +1985,20 @@ static int ch390_setup_irq(struct ch390_priv *dev)
 
 	/* if your platform supports acquire irq number from dts */
 #ifdef USE_IRQ_FROM_DTS
+	int irq_type;
+
 	ndev->irq = spi->irq; /* by dts */
 	if (spi->irq <= 0) {
 		netdev_err(ndev, "invalid irq %d from dts\n", spi->irq);
+		return -EINVAL;
+	}
+
+	irq_type = ch390_irq_type(dev);
+	if (irq_type && !ch390_irq_type_is_level(irq_type)) {
+		netdev_err(
+			ndev,
+			"unsupported irq trigger type 0x%x, only level low/high are supported\n",
+			irq_type);
 		return -EINVAL;
 	}
 #else
@@ -1958,202 +2049,6 @@ static int ch390_request_irq(struct ch390_priv *dev)
 	return 0;
 }
 
-static ssize_t phy_rw_show(struct device *device,
-			   struct device_attribute *attr, char *buf)
-{
-	struct net_device *ndev = dev_get_drvdata(device);
-	struct ch390_priv *dev;
-
-	if (!ndev) {
-		dev_err(device, "phy_rw_show: net_device is NULL\n");
-		return -EINVAL;
-	}
-
-	dev = netdev_priv(ndev);
-	if (!dev) {
-		dev_err(device, "phy_rw_show: ch390 is NULL\n");
-		return -EINVAL;
-	}
-
-	dev->sysfs_phy_buf[sizeof(dev->sysfs_phy_buf) - 1] = '\0';
-	return scnprintf(buf, PAGE_SIZE, "%s\n", dev->sysfs_phy_buf);
-}
-
-/*
- *   read <reg_hex>
- *   write <reg_hex> <val_hex>
- *   read_ext <page_hex> <reg_hex>
- *   write_ext <page_hex> <reg_hex> <val_hex>
- *
- *   echo "read 0x10" > phy_rw
- *   echo "write 0x10 0xab" > phy_rw
- *   echo "read_ext 0x07 0x10" > phy_rw
- *   echo "write_ext 0x07 0x10 0xab" > phy_rw
- */
-static ssize_t phy_rw_store(struct device *device,
-			    struct device_attribute *attr, const char *buf,
-			    size_t count)
-{
-	struct net_device *ndev = dev_get_drvdata(device);
-	struct ch390_priv *dev;
-	char cmd[16];
-	unsigned int a = 0, b = 0, c = 0;
-	int args;
-	int ret;
-	unsigned int read_val = 0;
-
-	if (!ndev) {
-		dev_err(device, "phy_rw_store: net_device is NULL\n");
-		return -EINVAL;
-	}
-
-	dev = netdev_priv(ndev);
-	if (!dev) {
-		dev_err(device, "phy_rw_store: ch390 is NULL\n");
-		return -EINVAL;
-	}
-
-	memset(dev->sysfs_phy_buf, 0, sizeof(dev->sysfs_phy_buf));
-
-	args = sscanf(buf, "%15s %x %x %x", cmd, &a, &b, &c);
-
-	if (args >= 1) {
-		if (strcmp(cmd, "read") == 0 && args == 2) {
-			u8 reg = (u8)a;
-			ret = ch390_phyread(dev, reg, &read_val);
-			if (ret) {
-				dev_err(device,
-					"phy read failed reg=0x%02x ret=%d\n",
-					reg, ret);
-				scnprintf(dev->sysfs_phy_buf,
-					  sizeof(dev->sysfs_phy_buf),
-					  "read reg 0x%02x failed (%d)",
-					  reg, ret);
-			} else {
-				scnprintf(dev->sysfs_phy_buf,
-					  sizeof(dev->sysfs_phy_buf),
-					  "read reg 0x%02x = 0x%04x", reg,
-					  read_val & 0xffff);
-				dev_info(device,
-					 "phy read reg 0x%02x = 0x%04x\n",
-					 reg, read_val & 0xffff);
-			}
-		} else if (strcmp(cmd, "write") == 0 && args == 3) {
-			u8 reg = (u8)a;
-			u16 val = (u16)b;
-			ret = ch390_phywrite(dev, reg, val);
-			if (ret) {
-				dev_err(device,
-					"phy write failed reg=0x%02x val=0x%04x ret=%d\n",
-					reg, val, ret);
-				scnprintf(
-					dev->sysfs_phy_buf,
-					sizeof(dev->sysfs_phy_buf),
-					"write reg 0x%02x val 0x%04x failed (%d)",
-					reg, val, ret);
-			} else {
-				scnprintf(
-					dev->sysfs_phy_buf,
-					sizeof(dev->sysfs_phy_buf),
-					"write reg 0x%02x val 0x%04x success",
-					reg, val);
-				dev_info(device,
-					 "phy write reg 0x%02x = 0x%04x\n",
-					 reg, val);
-			}
-		} else if (strcmp(cmd, "read_ext") == 0 && args == 3) {
-			u8 page = (u8)a;
-			u8 reg = (u8)b;
-
-			ret = ch390_phywrite(dev, 0x1F, page);
-			if (ret) {
-				dev_err(device,
-					"set page failed page=0x%02x ret=%d\n",
-					page, ret);
-				scnprintf(dev->sysfs_phy_buf,
-					  sizeof(dev->sysfs_phy_buf),
-					  "set page 0x%02x failed (%d)",
-					  page, ret);
-			} else {
-				ret = ch390_phyread(dev, reg, &read_val);
-				if (ret) {
-					dev_err(device,
-						"phy read_ext failed page=0x%02x reg=0x%02x ret=%d\n",
-						page, reg, ret);
-					scnprintf(
-						dev->sysfs_phy_buf,
-						sizeof(dev->sysfs_phy_buf),
-						"read_ext page 0x%02x reg 0x%02x failed (%d)",
-						page, reg, ret);
-				} else {
-					scnprintf(
-						dev->sysfs_phy_buf,
-						sizeof(dev->sysfs_phy_buf),
-						"read_ext page 0x%02x reg 0x%02x = 0x%04x",
-						page, reg,
-						read_val & 0xffff);
-					dev_info(
-						device,
-						"phy read_ext page 0x%02x reg 0x%02x = 0x%04x\n",
-						page, reg,
-						read_val & 0xffff);
-				}
-			}
-		} else if (strcmp(cmd, "write_ext") == 0 && args == 4) {
-			u8 page = (u8)a;
-			u8 reg = (u8)b;
-			u16 val = (u16)c;
-			ret = ch390_phywrite(dev, 0x1F, page);
-			if (ret) {
-				dev_err(device,
-					"set page failed page=0x%02x ret=%d\n",
-					page, ret);
-				scnprintf(dev->sysfs_phy_buf,
-					  sizeof(dev->sysfs_phy_buf),
-					  "set page 0x%02x failed (%d)",
-					  page, ret);
-			} else {
-				ret = ch390_phywrite(dev, reg, val);
-				if (ret) {
-					dev_err(device,
-						"phy write_ext failed page=0x%02x reg=0x%02x val=0x%04x ret=%d\n",
-						page, reg, val, ret);
-					scnprintf(
-						dev->sysfs_phy_buf,
-						sizeof(dev->sysfs_phy_buf),
-						"write_ext page 0x%02x reg 0x%02x val 0x%04x failed (%d)",
-						page, reg, val, ret);
-				} else {
-					scnprintf(
-						dev->sysfs_phy_buf,
-						sizeof(dev->sysfs_phy_buf),
-						"write_ext page 0x%02x reg 0x%02x val 0x%04x success",
-						page, reg, val);
-					dev_info(
-						device,
-						"phy write_ext page 0x%02x reg 0x%02x = 0x%04x\n",
-						page, reg, val);
-				}
-			}
-		} else {
-			scnprintf(
-				dev->sysfs_phy_buf,
-				sizeof(dev->sysfs_phy_buf),
-				"Invalid cmd. Use: read|write|read_ext|write_ext");
-			dev_err(device,
-				"phy_rw_store: invalid command: %s\n",
-				cmd);
-		}
-	} else {
-		scnprintf(dev->sysfs_phy_buf, sizeof(dev->sysfs_phy_buf),
-			  "Parse failed");
-		dev_err(device,
-			"phy_rw_store: parse failed for input: %s\n", buf);
-	}
-
-	return count;
-}
-
 static ssize_t reg_dump_show(struct device *device,
 			     struct device_attribute *attr, char *buf)
 {
@@ -2180,16 +2075,16 @@ static ssize_t reg_dump_show(struct device *device,
 				reg_labels[i].name);
 			return -EIO;
 		}
-		len += sprintf(buf + len, "%s: 0x%02x\n",
-			       reg_labels[i].name, val);
+		len += sprintf(buf + len, "%s: 0x%02x\n", reg_labels[i].name,
+			       val);
 	}
 
 	return len;
 }
 
 static ssize_t reg_dump_store(struct device *device,
-			      struct device_attribute *attr,
-			      const char *buf, size_t count)
+			      struct device_attribute *attr, const char *buf,
+			      size_t count)
 {
 	struct net_device *ndev = dev_get_drvdata(device);
 	struct ch390_priv *dev;
@@ -2230,14 +2125,9 @@ static ssize_t reg_dump_store(struct device *device,
 	return count;
 }
 
-static DEVICE_ATTR(reg_dump, S_IRUGO | S_IWUSR, reg_dump_show,
-		   reg_dump_store);
+static DEVICE_ATTR(reg_dump, S_IRUGO | S_IWUSR, reg_dump_show, reg_dump_store);
 
-static DEVICE_ATTR(phy_rw, S_IRUGO | S_IWUSR, phy_rw_show, phy_rw_store);
-
-static struct attribute *ch390_attributes[] = { &dev_attr_reg_dump.attr,
-						&dev_attr_phy_rw.attr,
-						NULL };
+static struct attribute *ch390_attributes[] = { &dev_attr_reg_dump.attr, NULL };
 
 static struct attribute_group ch390_attribute_group = {
 	.attrs = ch390_attributes,
@@ -2265,8 +2155,8 @@ static int ch390_create_sysfs(struct ch390_priv *dev)
 		return ret;
 	}
 
-	snprintf(link_name, sizeof(dev->link_name), "ch390-%s-%d",
-		 ctrl_name, cs_num);
+	snprintf(link_name, sizeof(dev->link_name), "ch390-%s-%d", ctrl_name,
+		 cs_num);
 
 	ret = sysfs_create_link(NULL, &spi->dev.kobj, link_name);
 	if (ret < 0) {
@@ -2311,8 +2201,8 @@ static bool ch390_check_base_reg(struct ch390_priv *dev)
 
 	ret = mdiobus_read(dev->mdiobus, CH390_PHY_ADDR, MII_EXPANSION);
 	if (ret < 0) {
-		netdev_err(dev->ndev,
-			   "failed to read expansion register: %d\n", ret);
+		netdev_err(dev->ndev, "failed to read expansion register: %d\n",
+			   ret);
 		return false;
 	}
 	val = ret;
@@ -2341,8 +2231,7 @@ static int ch390_set_link_interrupt(struct ch390_priv *dev, bool enable)
 	else
 		val &= ~CH390_INT_LINKCHG;
 
-	return ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_INTERRUPT_MASK,
-				val);
+	return ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_INTERRUPT_MASK, val);
 }
 
 static int ch390_modify_page0(struct ch390_priv *dev, u32 regnum, u16 mask,
@@ -2374,8 +2263,7 @@ static void ch390_restore_page0(struct ch390_priv *dev)
 	ret = ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PAG_SEL,
 			       CH390_PHY_PAGE0);
 	if (ret < 0)
-		netdev_err(dev->ndev, "failed to restore PHY page0: %d\n",
-			   ret);
+		netdev_err(dev->ndev, "failed to restore PHY page0: %d\n", ret);
 }
 
 static void ch390_set_phypn(struct ch390_priv *dev)
@@ -2390,8 +2278,8 @@ static void ch390_set_phypn(struct ch390_priv *dev)
 
 	ret = ch390_set_link_interrupt(dev, false);
 	if (ret < 0) {
-		netdev_err(dev->ndev,
-			   "failed to disable link interrupt: %d\n", ret);
+		netdev_err(dev->ndev, "failed to disable link interrupt: %d\n",
+			   ret);
 		goto out;
 	}
 	link_int_disabled = true;
@@ -2401,8 +2289,7 @@ static void ch390_set_phypn(struct ch390_priv *dev)
 				 dev->regs->set_phypn_mask);
 	if (ret < 0) {
 		netdev_err(dev->ndev,
-			   "failed to set polarity recovery bit: %d\n",
-			   ret);
+			   "failed to set polarity recovery bit: %d\n", ret);
 		goto out;
 	}
 
@@ -2410,15 +2297,14 @@ static void ch390_set_phypn(struct ch390_priv *dev)
 				 dev->regs->set_phypn_mask, 0);
 	if (ret < 0) {
 		netdev_err(dev->ndev,
-			   "failed to clear polarity recovery bit: %d\n",
-			   ret);
+			   "failed to clear polarity recovery bit: %d\n", ret);
 		goto out;
 	}
 
 	ret = ch390_mdio_read(bus, CH390_PHY_ADDR, CH390_INTERRUPT_IND);
 	if (ret < 0)
-		netdev_err(dev->ndev,
-			   "failed to read interrupt status: %d\n", ret);
+		netdev_err(dev->ndev, "failed to read interrupt status: %d\n",
+			   ret);
 
 out:
 	if (link_int_disabled) {
@@ -2447,91 +2333,140 @@ static void ch390_latch_phypn(struct ch390_priv *dev)
 				 dev->regs->set_phypn_mask);
 	if (ret < 0)
 		netdev_err(dev->ndev,
-			   "failed to set polarity recovery bit: %d\n",
-			   ret);
+			   "failed to set polarity recovery bit: %d\n", ret);
 
 	ch390_restore_page0(dev);
 	mutex_unlock(&bus->mdio_lock);
 }
 
-static void ch390_check_phypn(struct ch390_priv *dev, bool autoneg)
+static bool ch390_prepare_phypn_check(struct ch390_priv *dev, bool autoneg,
+				      unsigned int *delay_ms)
 {
-	unsigned int delay_ms = autoneg ? 300 : 200;
-	int phy_stat, link;
+	int phy_stat;
 
 	phy_stat = ch390_page_read(dev, CH390_PHY_PAGE0,
 				   dev->regs->check_phypn_reg);
 	if (phy_stat < 0) {
 		netdev_err(dev->ndev, "failed to read PHY status0: %d\n",
 			   phy_stat);
-		return;
+		return false;
 	}
 
 	if (!(phy_stat & dev->regs->check_phypn_mask))
-		return;
+		return false;
 
-	msleep(delay_ms);
+	*delay_ms = autoneg ? 300 : 200;
+	ch390_reg_dbg(dev,
+		      "polarity set, autoneg=%d status0=0x%04x delay=%ums\n",
+		      autoneg, phy_stat & 0xffff, *delay_ms);
+
+	return true;
+}
+
+static int ch390_finish_phypn_check(struct ch390_priv *dev, bool autoneg)
+{
+	int link;
 
 	link = ch390_check_link_stat(dev);
 	if (link < 0)
-		return;
+		return link;
 
-	ch390_reg_dbg(
-		dev,
-		"polarity set, autoneg=%d status0=0x%04x link=%d delay=%ums\n",
-		autoneg, phy_stat & 0xffff, link, delay_ms);
+	ch390_reg_dbg(dev, "polarity recheck autoneg=%d link=%d\n", autoneg,
+		      link);
 
-	if (!link && (!autoneg || ch390_check_base_reg(dev)))
+	if (!link && (!autoneg || ch390_check_base_reg(dev))) {
+		dev->set_phypn_triggers++;
 		dev->dev_ops->set_phypn(dev);
+	}
+
+	return link;
 }
 
 /* Select the link-down maintenance sequence from the current PHY mode. */
-static void ch390_link_processing(struct ch390_priv *dev)
+static bool ch390_link_processing(struct ch390_priv *dev, bool *autoneg,
+				  unsigned int *delay_ms)
 {
 	unsigned int bmcr = 0;
-	int link, ret;
-
-	link = ch390_check_link_stat(dev);
-	if (link != 0)
-		return;
+	int ret;
 
 	ret = mdiobus_read(dev->mdiobus, CH390_PHY_ADDR, MII_BMCR);
 	if (ret < 0)
-		return;
+		return false;
 	bmcr = ret;
 
-	ch390_reg_dbg(dev, "bmcr=0x%04x link=%d\n", bmcr & 0xffff, link);
+	ch390_reg_dbg(dev, "bmcr=0x%04x\n", bmcr & 0xffff);
 
-	if (bmcr & BMCR_ANENABLE)
-		ch390_check_phypn(dev, true);
-	else if (!(bmcr & BMCR_SPEED100))
-		ch390_check_phypn(dev, false);
+	if (bmcr & BMCR_ANENABLE) {
+		*autoneg = true;
+		return ch390_prepare_phypn_check(dev, *autoneg, delay_ms);
+	}
+
+	if (!(bmcr & BMCR_SPEED100)) {
+		*autoneg = false;
+		return ch390_prepare_phypn_check(dev, *autoneg, delay_ms);
+	}
+
+	return false;
 }
 
 /* Periodic link-down monitor. Keeps maintenance active while link is absent. */
 static void ch390_linkdn_work(struct work_struct *work)
 {
-	struct ch390_priv *dev = container_of(
-		to_delayed_work(work), struct ch390_priv, linkdn_work);
+	struct ch390_priv *dev = container_of(to_delayed_work(work),
+					      struct ch390_priv, linkdn_work);
+	unsigned int delay_ms = 0;
+	bool phypn_pending;
+	bool autoneg = false;
 	int link = 0;
 
-	if (!READ_ONCE(dev->check_flag))
+	if (!test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags))
 		return;
 
-	link = ch390_check_link_stat(dev);
-	if (link < 0)
-		goto out;
+	phypn_pending = test_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
 
-	ch390_flow_dbg(dev, "link-down worker link=%d\n", link);
+	if (!mutex_trylock(&dev->spi_lockm))
+		goto out_reschedule;
 
-	if (!link)
-		ch390_link_processing(dev);
+	if (!test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags))
+		goto out_unlock;
 
-out:
-	if (READ_ONCE(dev->check_flag) && link <= 0)
-		mod_delayed_work(
-			dev->wq, &dev->linkdn_work,
-			msecs_to_jiffies(CH390_LINK_DOWN_INTVAL_MS));
+	if (phypn_pending) {
+		clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+		autoneg = test_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+		link = ch390_finish_phypn_check(dev, autoneg);
+		phypn_pending = false;
+		if (link < 0)
+			goto out_unlock;
+	} else {
+		link = ch390_check_link_stat(dev);
+		if (link < 0)
+			goto out_unlock;
+
+		ch390_flow_dbg(dev, "link-down worker link=%d\n", link);
+
+		if (!link)
+			phypn_pending =
+				ch390_link_processing(dev, &autoneg, &delay_ms);
+	}
+
+out_unlock:
+	mutex_unlock(&dev->spi_lockm);
+
+	if (phypn_pending && test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags)) {
+		if (autoneg)
+			set_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+		else
+			clear_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+		set_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+		mod_delayed_work(dev->wq, &dev->linkdn_work,
+				 msecs_to_jiffies(delay_ms));
+		return;
+	}
+
+out_reschedule:
+	if (test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags) && link <= 0)
+		mod_delayed_work(dev->wq, &dev->linkdn_work,
+				 msecs_to_jiffies(CH390_LINK_DOWN_INTVAL_MS));
 }
 
 /* Use phylib's resolved speed for link-up monitoring. */
@@ -2544,56 +2479,67 @@ static bool ch390_is_100m_link(struct ch390_priv *dev)
 	return phydev->speed == SPEED_100;
 }
 
-/* Link-up health check: verify PHY-side status before recovery. */
-static bool ch390_check_link(struct ch390_priv *dev)
+static int ch390_read_linkup_sample(struct ch390_priv *dev)
 {
-	int val = 0, zero_count = 0, one_count = 0, i;
+	int val;
+
+	val = ch390_page_read(dev, dev->regs->check_link_page,
+			      dev->regs->check_link_reg);
+	if (val < 0) {
+		netdev_err(dev->ndev, "failed to read link-up status: %d\n",
+			   val);
+		return val;
+	}
+
+	ch390_reg_dbg(dev, "link-up page=0x%02x reg=0x%02x val=0x%04x\n",
+		      dev->regs->check_link_page, dev->regs->check_link_reg,
+		      val & 0xffff);
+
+	return !!(val & dev->regs->check_link_mask);
+}
+
+static void ch390_restart_false_link(struct ch390_priv *dev)
+{
 	int link, ret;
 
-	for (i = 0; i < CH390_LINK_UP_FAIL_COUNT; i++) {
-		val = ch390_page_read(dev, dev->regs->check_link_page,
-				      dev->regs->check_link_reg);
-		if (val < 0) {
+	link = ch390_check_link_stat(dev);
+	ch390_flow_dbg(dev, "link-up status bad count=%d link=%d\n",
+		       CH390_LINK_UP_FAIL_COUNT, link);
+
+	if (link > 0 && ch390_is_100m_link(dev)) {
+		dev->linkup_restarts++;
+		ret = ch390_all_restart(dev);
+		if (ret < 0)
 			netdev_err(dev->ndev,
-				   "failed to read link-up status: %d\n",
-				   val);
+				   "failed to reset after false link: %d\n",
+				   ret);
+	}
+}
+
+/* Link-up health check: sample PHY-side status before recovery. */
+static bool ch390_check_link(struct ch390_priv *dev)
+{
+	bool all_bad = true;
+	int ok_run = 0;
+	int sample;
+	int i;
+
+	for (i = 0; i < CH390_LINK_UP_FAIL_COUNT; i++) {
+		sample = ch390_read_linkup_sample(dev);
+		if (sample < 0)
 			return false;
-		}
 
-		ch390_reg_dbg(
-			dev, "link-up page=0x%02x reg=0x%02x val=0x%04x\n",
-			dev->regs->check_link_page,
-			dev->regs->check_link_reg, val & 0xffff);
-
-		if (val & dev->regs->check_link_mask) {
-			one_count++;
-			zero_count = 0;
-			if (one_count >= CH390_LINK_UP_PASS_COUNT) {
-				ch390_flow_dbg(
-					dev,
-					"link-up status ok count=%d\n",
-					one_count);
+		/* Two adjacent good samples are enough to trust the link. */
+		if (sample) {
+			all_bad = false;
+			if (++ok_run >= CH390_LINK_UP_PASS_COUNT) {
+				ch390_flow_dbg(dev,
+					       "link-up status ok count=%d\n",
+					       ok_run);
 				return true;
 			}
 		} else {
-			zero_count++;
-			one_count = 0;
-			if (zero_count >= CH390_LINK_UP_FAIL_COUNT) {
-				link = ch390_check_link_stat(dev);
-				ch390_flow_dbg(
-					dev,
-					"link-up status bad count=%d link=%d\n",
-					zero_count, link);
-				if (link > 0 && ch390_is_100m_link(dev)) {
-					ret = ch390_all_restart(dev);
-					if (ret < 0)
-						netdev_err(
-							dev->ndev,
-							"failed to reset after false link: %d\n",
-							ret);
-				}
-				return false;
-			}
+			ok_run = 0;
 		}
 
 		if (i + 1 < CH390_LINK_UP_FAIL_COUNT)
@@ -2601,33 +2547,38 @@ static bool ch390_check_link(struct ch390_priv *dev)
 				     CH390_LINK_UP_SAMPLE_DELAY_US + 500);
 	}
 
+	/* Recovery is reserved for a fully bad sample window. */
+	if (all_bad)
+		ch390_restart_false_link(dev);
+
 	return false;
 }
 
 /* Periodic link-up monitor. Runs only while link remains active. */
 static void ch390_linkup_work(struct work_struct *work)
 {
-	struct ch390_priv *dev = container_of(
-		to_delayed_work(work), struct ch390_priv, linkup_work);
-	int link = 0;
+	struct ch390_priv *dev = container_of(to_delayed_work(work),
+					      struct ch390_priv, linkup_work);
+	int link = 1;
 
-	if (!READ_ONCE(dev->check_flag) ||
-	    !READ_ONCE(dev->linkup_check_active))
+	if (!test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags) ||
+	    !test_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags))
 		return;
 
-	mutex_lock(&dev->spi_lockm);
+	if (!mutex_trylock(&dev->spi_lockm))
+		goto out_reschedule;
 
-	if (!READ_ONCE(dev->check_flag) ||
-	    !READ_ONCE(dev->linkup_check_active))
+	if (!test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags) ||
+	    !test_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags))
 		goto out_unlock;
 
 	if (!ch390_is_100m_link(dev)) {
-		WRITE_ONCE(dev->linkup_check_active, false);
+		clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
 		goto out_unlock;
 	}
 
 	if (ch390_check_link(dev)) {
-		WRITE_ONCE(dev->linkup_check_active, false);
+		clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
 		goto out_unlock;
 	}
 
@@ -2635,16 +2586,16 @@ static void ch390_linkup_work(struct work_struct *work)
 	ch390_flow_dbg(dev, "link-up worker link=%d\n", link);
 
 	if (link == 0)
-		WRITE_ONCE(dev->linkup_check_active, false);
+		clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
 
 out_unlock:
 	mutex_unlock(&dev->spi_lockm);
 
-	if (READ_ONCE(dev->check_flag) &&
-	    READ_ONCE(dev->linkup_check_active) && link != 0)
-		mod_delayed_work(
-			dev->wq, &dev->linkup_work,
-			msecs_to_jiffies(CH390_LINK_UP_INTVAL_MS));
+out_reschedule:
+	if (test_bit(CH390_LINK_CHECK_ENABLED, &dev->flags) &&
+	    test_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags) && link != 0)
+		mod_delayed_work(dev->wq, &dev->linkup_work,
+				 msecs_to_jiffies(CH390_LINK_UP_INTVAL_MS));
 }
 
 static int ch390_init(struct ch390_priv *dev)
@@ -2653,8 +2604,7 @@ static int ch390_init(struct ch390_priv *dev)
 
 	val = ch390_page_read(dev, CH390_PHY_PAGE0, CH390_PHY_STATUS0);
 	if (val < 0) {
-		netdev_err(dev->ndev, "failed to read PHY_STATUS0: %d\n",
-			   val);
+		netdev_err(dev->ndev, "failed to read PHY_STATUS0: %d\n", val);
 		return val;
 	}
 
@@ -2666,8 +2616,8 @@ static int ch390_init(struct ch390_priv *dev)
 		dev->dev_ops = &ch390_latch_phypn_ops;
 	}
 
-	printk(KERN_INFO "ch390-%d device probe, driver version: %s\n",
-	       val, VERSION_DESC);
+	printk(KERN_INFO "ch390-%d device probe, driver version: %s\n", val,
+	       VERSION_DESC);
 
 	return 0;
 }
@@ -2707,14 +2657,17 @@ static int ch390_probe(struct spi_device *spi)
 
 	ndev->netdev_ops = &ch390_netdev_ops;
 	ndev->ethtool_ops = &ch390_ethtool_ops;
+	ndev->watchdog_timeo = 5 * HZ;
 
 	mutex_init(&dev->spi_lockm);
 	mutex_init(&dev->phy_mutex);
 	mutex_init(&dev->reg_mutex);
-	spin_lock_init(&dev->rctl_lock);
 
-	WRITE_ONCE(dev->check_flag, false);
-	WRITE_ONCE(dev->linkup_check_active, false);
+	clear_bit(CH390_LINK_CHECK_ENABLED, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+	clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
+	set_bit(CH390_DEV_STOPPING, &dev->flags);
 
 	dev->wq = alloc_workqueue("ch390_wq", WQ_MEM_RECLAIM, 1);
 	if (!dev->wq) {
@@ -2725,8 +2678,9 @@ static int ch390_probe(struct spi_device *spi)
 
 	INIT_DELAYED_WORK(&dev->linkdn_work, ch390_linkdn_work);
 	INIT_DELAYED_WORK(&dev->linkup_work, ch390_linkup_work);
-	INIT_WORK(&dev->rxctrl_work, ch390_rxctl_delay);
+	INIT_WORK(&dev->rx_mode_work, ch390_rx_mode_delay);
 	INIT_WORK(&dev->tx_work, ch390_tx_delay);
+	INIT_WORK(&dev->tx_timeout_work, ch390_tx_timeout_work);
 
 	ret = ch390_map_chipid(dev);
 	if (ret)
@@ -2776,7 +2730,13 @@ out_phy_disconnect:
 out_mdio:
 	ch390_mdio_unregister(dev);
 out_wq:
-	WRITE_ONCE(dev->linkup_check_active, false);
+	set_bit(CH390_DEV_STOPPING, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+	clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
+	cancel_work_sync(&dev->tx_work);
+	cancel_work_sync(&dev->tx_timeout_work);
+	cancel_work_sync(&dev->rx_mode_work);
 	cancel_delayed_work_sync(&dev->linkdn_work);
 	cancel_delayed_work_sync(&dev->linkup_work);
 	destroy_workqueue(dev->wq);
@@ -2799,8 +2759,14 @@ static void ch390_drv_remove(struct spi_device *spi)
 	sysfs_remove_link(NULL, dev->link_name);
 	sysfs_remove_group(&spi->dev.kobj, &ch390_attribute_group);
 	unregister_netdev(ndev);
-	WRITE_ONCE(dev->check_flag, false);
-	WRITE_ONCE(dev->linkup_check_active, false);
+	set_bit(CH390_DEV_STOPPING, &dev->flags);
+	clear_bit(CH390_LINK_CHECK_ENABLED, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+	clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
+	cancel_work_sync(&dev->tx_work);
+	cancel_work_sync(&dev->tx_timeout_work);
+	cancel_work_sync(&dev->rx_mode_work);
 	cancel_delayed_work_sync(&dev->linkdn_work);
 	cancel_delayed_work_sync(&dev->linkup_work);
 	destroy_workqueue(dev->wq);
@@ -2824,8 +2790,14 @@ static int ch390_drv_remove(struct spi_device *spi)
 	sysfs_remove_link(NULL, dev->link_name);
 	sysfs_remove_group(&spi->dev.kobj, &ch390_attribute_group);
 	unregister_netdev(ndev);
-	WRITE_ONCE(dev->check_flag, false);
-	WRITE_ONCE(dev->linkup_check_active, false);
+	set_bit(CH390_DEV_STOPPING, &dev->flags);
+	clear_bit(CH390_LINK_CHECK_ENABLED, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_PENDING, &dev->flags);
+	clear_bit(CH390_LINKDN_CHECK_AUTONEG, &dev->flags);
+	clear_bit(CH390_LINKUP_CHECK_ACTIVE, &dev->flags);
+	cancel_work_sync(&dev->tx_work);
+	cancel_work_sync(&dev->tx_timeout_work);
+	cancel_work_sync(&dev->rx_mode_work);
 	cancel_delayed_work_sync(&dev->linkdn_work);
 	cancel_delayed_work_sync(&dev->linkup_work);
 	destroy_workqueue(dev->wq);
