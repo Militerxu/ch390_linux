@@ -878,8 +878,8 @@ static int ch390_page_read(struct ch390_priv *dev, int page, int regnum)
 		netdev_err(dev->ndev, "error %d reading PHY page %d reg %d\n",
 			   ret, page, regnum);
 
-	ret = ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PAG_SEL,
-			       CH390_PHY_PAGE0);
+	ch390_mdio_write(bus, CH390_PHY_ADDR, CH390_PHY_PAG_SEL,
+			 CH390_PHY_PAGE0);
 
 out_unlock:
 	mutex_unlock(&bus->mdio_lock);
